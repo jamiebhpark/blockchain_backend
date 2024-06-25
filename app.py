@@ -8,6 +8,7 @@ from web3 import Web3
 from dotenv import load_dotenv
 import os
 from models import db, User, Transaction
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # .env 파일 로드
 load_dotenv()
@@ -86,7 +87,7 @@ def create_blockchain_transaction(sender, receiver, amount):
 def register():
     data = request.get_json()
     username = data.get('username')
-    password = data.get('password')
+    password = generate_password_hash(data.get('password'))  # 해시된 비밀번호 저장
     ethereum_address = data.get('ethereum_address')
     if User.query.filter_by(username=username).first() is not None:
         return jsonify({"error": "User already exists"}), 400
@@ -102,13 +103,32 @@ def login():
     username = data.get('username')
     password = data.get('password')
 
-    user = User.query.filter_by(username=username, password=password).first()
-    if user is None:
+    user = User.query.filter_by(username=username).first()
+    if user is None or not check_password_hash(user.password, password):
         return jsonify({'message': 'Invalid username or password'}), 401
 
     token = jwt.encode({'username': username, 'exp': datetime.now(timezone.utc) + timedelta(minutes=30)},
                        app.config['SECRET_KEY'])
     return jsonify({'token': token})
+
+
+@app.route('/update_profile', methods=['POST'])
+@token_required
+def update_profile(current_user):
+    data = request.get_json()
+    ethereum_address = data.get('ethereum_address')
+
+    if not ethereum_address:
+        return jsonify({"error": "Ethereum address is required"}), 400
+
+    user = User.query.filter_by(username=current_user).first()
+    if user is None:
+        return jsonify({"error": "User does not exist"}), 400
+
+    user.ethereum_address = ethereum_address
+    db.session.commit()
+
+    return jsonify({"message": "Profile updated successfully"}), 200
 
 
 @app.route('/transaction', methods=['POST'])
@@ -117,37 +137,43 @@ def create_transaction(current_user):
     data = request.get_json()
     print(f"Received data: {data}")
     sender = current_user
-    receiver = data.get('receiver')
+    receiver_input = data.get('receiver')
     amount = data.get('amount')
 
-    if not sender or not receiver or not amount:
-        print(f"Error: Missing data: sender={sender}, receiver={receiver}, amount={amount}")
+    if not sender or not receiver_input or not amount:
+        print(f"Error: Missing data: sender={sender}, receiver={receiver_input}, amount={amount}")
         return jsonify({"error": "Missing data"}), 400
 
-    user = User.query.filter_by(username=sender).first()
-    if user is None:
+    sender_user = User.query.filter_by(username=sender).first()
+    if sender_user is None:
         print(f"Error: User does not exist: sender={sender}")
         return jsonify({"error": "User does not exist"}), 400
-    if user.assets < float(amount):
-        print(f"Error: Insufficient assets: sender={sender}, assets={user.assets}, amount={amount}")
+    if sender_user.assets < float(amount):
+        print(f"Error: Insufficient assets: sender={sender}, assets={sender_user.assets}, amount={amount}")
         return jsonify({"error": "Insufficient assets"}), 400
 
-    sender_ethereum_address = user.ethereum_address
+    # 수신자가 ID인지 지갑 주소인지 확인
+    receiver_user = User.query.filter(
+        (User.username == receiver_input) | (User.ethereum_address == receiver_input)).first()
+    receiver_address = receiver_input if not receiver_user else receiver_user.ethereum_address
+
+    if receiver_address == sender_user.ethereum_address:
+        print(f"Error: Sender and receiver addresses are the same.")
+        return jsonify({"error": "Sender and receiver addresses are the same."}), 400
 
     # 블록체인 트랜잭션 생성
-    txn_hash = create_blockchain_transaction(sender_ethereum_address, receiver, amount)
+    txn_hash = create_blockchain_transaction(sender_user.ethereum_address, receiver_address, amount)
     if not txn_hash:
         print(f"Error: Failed to create blockchain transaction")
         return jsonify({"error": "Failed to create blockchain transaction"}), 400
 
-    user.assets -= float(amount)
-    receiver_user = User.query.filter_by(ethereum_address=receiver).first()
+    sender_user.assets -= float(amount)
     if receiver_user:
         receiver_user.assets += float(amount)
     transaction_record = Transaction(
         id=str(uuid.uuid4()),
         sender=sender,
-        receiver=receiver,
+        receiver=receiver_address,
         amount=amount,
         timestamp=datetime.now(timezone.utc),
         txn_hash=txn_hash
@@ -172,6 +198,23 @@ def get_transactions(current_user):
 def get_assets(current_user):
     user = User.query.filter_by(username=current_user).first()
     return jsonify({"assets": user.assets}), 200
+
+
+@app.route('/eth_balance', methods=['GET'])
+@token_required
+def get_eth_balance(current_user):
+    user = User.query.filter_by(username=current_user).first()
+    if user is None:
+        return jsonify({"error": "User does not exist"}), 400
+
+    try:
+        print(f"Fetching balance for address: {user.ethereum_address}")  # Debugging
+        balance = web3.eth.get_balance(user.ethereum_address)
+        eth_balance = web3.from_wei(balance, 'ether')
+        return jsonify({"eth_balance": float(eth_balance)}), 200
+    except Exception as e:
+        print(f"Error fetching balance: {str(e)}")  # Debugging
+        return jsonify({"error": str(e)}), 500
 
 
 def calculate_transaction_cost():
