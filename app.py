@@ -1,3 +1,4 @@
+# app.py
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta, timezone
 import uuid
@@ -6,15 +7,17 @@ from functools import wraps
 from web3 import Web3
 from dotenv import load_dotenv
 import os
+from models import db, User, Transaction
 
 # .env 파일 로드
 load_dotenv()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_secret_key'  # JWT 시크릿 키 설정
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///database.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-users = {}
-transactions = []
+db.init_app(app)
 
 # Infura를 통해 Sepolia 테스트넷 노드에 연결
 infura_url = os.getenv('INFURA_URL')
@@ -50,7 +53,6 @@ def token_required(f):
     return decorator
 
 
-# 블록체인 트랜잭션 생성 함수
 def create_blockchain_transaction(sender, receiver, amount):
     try:
         gas_price = web3.to_wei('1', 'gwei')  # 가스 가격을 1 gwei로 설정
@@ -86,13 +88,11 @@ def register():
     username = data.get('username')
     password = data.get('password')
     ethereum_address = data.get('ethereum_address')
-    if username in users:
+    if User.query.filter_by(username=username).first() is not None:
         return jsonify({"error": "User already exists"}), 400
-    users[username] = {
-        "assets": 1000,  # Initial assets
-        "password": password,
-        "ethereum_address": ethereum_address  # 사용자 Ethereum 주소 추가
-    }
+    user = User(username=username, password=password, ethereum_address=ethereum_address)
+    db.session.add(user)
+    db.session.commit()
     return jsonify({"message": "User registered successfully"}), 201
 
 
@@ -102,8 +102,8 @@ def login():
     username = data.get('username')
     password = data.get('password')
 
-    user = users.get(username)
-    if not user or user['password'] != password:
+    user = User.query.filter_by(username=username, password=password).first()
+    if user is None:
         return jsonify({'message': 'Invalid username or password'}), 401
 
     token = jwt.encode({'username': username, 'exp': datetime.now(timezone.utc) + timedelta(minutes=30)},
@@ -124,14 +124,15 @@ def create_transaction(current_user):
         print(f"Error: Missing data: sender={sender}, receiver={receiver}, amount={amount}")
         return jsonify({"error": "Missing data"}), 400
 
-    if sender not in users:
+    user = User.query.filter_by(username=sender).first()
+    if user is None:
         print(f"Error: User does not exist: sender={sender}")
         return jsonify({"error": "User does not exist"}), 400
-    if users[sender]['assets'] < float(amount):
-        print(f"Error: Insufficient assets: sender={sender}, assets={users[sender]['assets']}, amount={amount}")
+    if user.assets < float(amount):
+        print(f"Error: Insufficient assets: sender={sender}, assets={user.assets}, amount={amount}")
         return jsonify({"error": "Insufficient assets"}), 400
 
-    sender_ethereum_address = users[sender]['ethereum_address']
+    sender_ethereum_address = user.ethereum_address
 
     # 블록체인 트랜잭션 생성
     txn_hash = create_blockchain_transaction(sender_ethereum_address, receiver, amount)
@@ -139,18 +140,20 @@ def create_transaction(current_user):
         print(f"Error: Failed to create blockchain transaction")
         return jsonify({"error": "Failed to create blockchain transaction"}), 400
 
-    users[sender]['assets'] -= float(amount)
-    if receiver in users:
-        users[receiver]['assets'] += float(amount)
-    transaction_record = {
-        "id": str(uuid.uuid4()),
-        "sender": sender,
-        "receiver": receiver,
-        "amount": amount,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "txn_hash": txn_hash
-    }
-    transactions.append(transaction_record)
+    user.assets -= float(amount)
+    receiver_user = User.query.filter_by(ethereum_address=receiver).first()
+    if receiver_user:
+        receiver_user.assets += float(amount)
+    transaction_record = Transaction(
+        id=str(uuid.uuid4()),
+        sender=sender,
+        receiver=receiver,
+        amount=amount,
+        timestamp=datetime.now(timezone.utc),
+        txn_hash=txn_hash
+    )
+    db.session.add(transaction_record)
+    db.session.commit()
 
     return jsonify({"message": "Transaction successful", "txn_hash": txn_hash}), 201
 
@@ -158,14 +161,17 @@ def create_transaction(current_user):
 @app.route('/transactions', methods=['GET'])
 @token_required
 def get_transactions(current_user):
-    user_transactions = [t for t in transactions if t['sender'] == current_user or t['receiver'] == current_user]
-    return jsonify(user_transactions), 200
+    user_transactions = Transaction.query.filter(
+        (Transaction.sender == current_user) | (Transaction.receiver == current_user)
+    ).all()
+    return jsonify([t.as_dict() for t in user_transactions]), 200
 
 
 @app.route('/assets', methods=['GET'])
 @token_required
 def get_assets(current_user):
-    return jsonify({"assets": users[current_user]['assets']}), 200
+    user = User.query.filter_by(username=current_user).first()
+    return jsonify({"assets": user.assets}), 200
 
 
 def calculate_transaction_cost():
@@ -179,4 +185,6 @@ print(f"PRIVATE_KEY_ADDRESS: {PRIVATE_KEY_ADDRESS}")
 print(f"Estimated transaction cost: {calculate_transaction_cost()} ETH")
 
 if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()  # 데이터베이스 테이블 생성
     app.run(host='0.0.0.0', port=5001, debug=True)
